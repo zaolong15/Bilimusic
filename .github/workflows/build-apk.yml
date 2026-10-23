@@ -1,7 +1,7 @@
 name: Build APK
 on:
   push:
-分支: [main, master]
+    branches: [main, master]
   workflow_dispatch:
 jobs:
   build:
