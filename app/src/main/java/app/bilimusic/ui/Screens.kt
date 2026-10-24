@@ -5,6 +5,8 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -33,11 +35,13 @@ import coil.compose.AsyncImage
 fun LibraryScreen(vm: AppViewModel, onOpen: (Long) -> Unit) {
     val lists by vm.playlists.collectAsStateWithLifecycle()
     val favCount by vm.favoriteCount.collectAsStateWithLifecycle()
+    val dlCount by vm.downloadedCount.collectAsStateWithLifecycle()
     var creating by remember { mutableStateOf(false) }
 
     LazyColumn(Modifier.fillMaxSize()) {
         item { ScreenTitle("资料库") }
         item { NavRow("我喜欢的", "$favCount 首") { onOpen(FAVORITES_ID) } }
+        item { NavRow("已下载", "$dlCount 首") { onOpen(DOWNLOADS_ID) } }
         item {
             Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 24.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("歌单", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
@@ -45,7 +49,7 @@ fun LibraryScreen(vm: AppViewModel, onOpen: (Long) -> Unit) {
             }
         }
         if (lists.isEmpty()) {
-            item { Hint("还没有歌单。可以新建一个，或者在「我的」里把 B 站收藏夹导入为歌单。") }
+            item { Hint("还没有歌单。可以新建一个，在「我的」里导入 B 站收藏夹，或在「设置」里导入备份文件。") }
         }
         items(lists, key = { it.playlist.id }) { p ->
             NavRow(p.playlist.name, "${p.count} 首") { onOpen(p.playlist.id) }
@@ -76,24 +80,36 @@ fun ListScreen(vm: AppViewModel, id: Long, onBack: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri != null) vm.exportTo(uri, id)
+    }
 
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "返回") }
             Text(name, Modifier.weight(1f), style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (id != FAVORITES_ID) {
+            if (id != DOWNLOADS_ID) {
                 Box {
-                    IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "歌单操作") }
+                    IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "更多操作") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(text = { Text("重命名") }, onClick = { menu = false; renaming = true })
-                        DropdownMenuItem(text = { Text("删除歌单") }, onClick = { menu = false; deleting = true })
+                        DropdownMenuItem(text = { Text("下载全部") }, enabled = songs.isNotEmpty(),
+                            onClick = { menu = false; vm.download(songs) })
+                        if (id > 0) {
+                            DropdownMenuItem(text = { Text("导出此歌单") },
+                                onClick = { menu = false; exportLauncher.launch(safeFileName("BiliMusic-$name") + ".json") })
+                            DropdownMenuItem(text = { Text("重命名") }, onClick = { menu = false; renaming = true })
+                            DropdownMenuItem(text = { Text("删除歌单") }, onClick = { menu = false; deleting = true })
+                        }
                     }
                 }
             }
         }
         if (songs.isEmpty()) {
-            Hint(if (id == FAVORITES_ID) "收藏的歌曲会出现在这里。在搜索结果里点心形图标即可收藏。"
-                 else "歌单还是空的。在搜索结果里点「更多」，选择「加入歌单」。")
+            Hint(when (id) {
+                FAVORITES_ID -> "收藏的歌曲会出现在这里。在搜索结果里点心形图标即可收藏。"
+                DOWNLOADS_ID -> "下载过的歌曲会出现在这里，没有网络也能播放。在歌曲的「更多」里选择「下载到本地」。"
+                else -> "歌单还是空的。在搜索结果里点「更多」，选择「加入歌单」。"
+            })
         }
         SongList(
             songs = songs, vm = vm, player = player,
@@ -106,7 +122,7 @@ fun ListScreen(vm: AppViewModel, id: Long, onBack: () -> Unit) {
                     }
                 }
             },
-            removeLabel = if (id == FAVORITES_ID) "取消收藏" else "移出歌单",
+            removeLabel = when (id) { FAVORITES_ID -> "取消收藏"; DOWNLOADS_ID -> "删除下载"; else -> "移出歌单" },
             onRemove = { vm.removeFromPlaylist(id, it) }
         )
     }
@@ -164,7 +180,7 @@ fun SearchScreen(vm: AppViewModel) {
 
 // ---------------------------------------------------------------- 我的
 @Composable
-fun AccountScreen(vm: AppViewModel, onLogin: () -> Unit) {
+fun AccountScreen(vm: AppViewModel, onLogin: () -> Unit, onSettings: () -> Unit) {
     val user by vm.user.collectAsStateWithLifecycle()
     val folders by vm.folders.collectAsStateWithLifecycle()
     val importing by vm.importing.collectAsStateWithLifecycle()
@@ -172,6 +188,7 @@ fun AccountScreen(vm: AppViewModel, onLogin: () -> Unit) {
 
     LazyColumn(Modifier.fillMaxSize()) {
         item { ScreenTitle("我的") }
+        item { NavRow("设置", "外观、下载、数据", onSettings) }
         val u = user
         if (u == null) {
             item {

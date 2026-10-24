@@ -4,6 +4,9 @@ import android.text.Html
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import kotlin.coroutines.cancellation.CancellationException
 import java.net.SocketTimeoutException
 import java.net.URLEncoder
 import java.net.UnknownHostException
@@ -216,5 +219,66 @@ class BiliApi(private val session: Session) {
         val safe = url.https()
         urlCache[bvid] = safe to System.currentTimeMillis()
         return safe
+    }
+
+    // ---------- 下载 ----------
+    /**
+     * 把音频流写入 target。先写 .part，完成后改名；若 .part 已存在则用 Range 断点续传。
+     * isCancelled 为 true 时抛出 CancellationException，由调用方决定是否清理 .part。
+     */
+    fun download(bvid: String, target: File, isCancelled: () -> Boolean, onProgress: (Float) -> Unit) {
+        val part = File(target.path + ".part")
+        repeat(2) { attempt ->
+            val existing = if (attempt == 0 && part.exists()) part.length() else 0L
+            val rb = Request.Builder().url(audioUrl(bvid)).header("User-Agent", UA).header("Referer", REFERER)
+            if (existing > 0) rb.header("Range", "bytes=$existing-")
+            val done: Boolean? = http.newCall(rb.build()).execute().use { resp ->
+                when {
+                    resp.code == 416 -> { part.delete(); null }   // 残留文件与服务器不一致，从头再来
+                    !resp.isSuccessful -> throw BiliException(resp.code, "下载失败（HTTP ${resp.code}）")
+                    else -> {
+                        val body = resp.body ?: throw BiliException(-1, "服务器没有返回内容")
+                        val resumed = resp.code == 206 && existing > 0
+                        val start = if (resumed) existing else 0L
+                        val len = body.contentLength()
+                        val total = if (len > 0) start + len else -1L
+                        FileOutputStream(part, resumed).use { out ->
+                            body.byteStream().use { input ->
+                                val buf = ByteArray(64 * 1024)
+                                var got = start
+                                while (true) {
+                                    if (isCancelled()) throw CancellationException("已取消")
+                                    val n = input.read(buf)
+                                    if (n < 0) break
+                                    out.write(buf, 0, n)
+                                    got += n
+                                    if (total > 0) onProgress(got.toFloat() / total)
+                                }
+                            }
+                        }
+                        if (total > 0 && part.length() != total) throw BiliException(-1, "文件不完整，请重试。已下载的部分会保留，重试时会接着下。")
+                        true
+                    }
+                }
+            }
+            if (done == true) {
+                target.delete()
+                if (!part.renameTo(target)) throw BiliException(-1, "无法保存文件")
+                return
+            }
+        }
+        throw BiliException(-1, "下载失败，请重试")
+    }
+
+    /** 读取单个视频的基本信息（用于按 BV 号导入）。 */
+    fun videoInfo(bvid: String): Song {
+        val d = getJson("https://api.bilibili.com/x/web-interface/view?bvid=$bvid").getJSONObject("data")
+        return Song(
+            bvid = bvid,
+            title = plain(d.optString("title")),
+            artist = d.optJSONObject("owner")?.optString("name").orEmpty(),
+            cover = d.optString("pic").https(),
+            durationSec = d.optInt("duration")
+        )
     }
 }
