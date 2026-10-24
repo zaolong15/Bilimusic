@@ -6,6 +6,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -44,7 +45,18 @@ class MainActivity : ComponentActivity() {
             registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
                 .launch(Manifest.permission.POST_NOTIFICATIONS)
         }
-        setContent { AppTheme { BiliMusicApp() } }
+        setContent {
+            val vm: AppViewModel = viewModel()
+            val ap by vm.appearance.collectAsStateWithLifecycle()
+            val dark = resolveDark(ap.mode)
+            // 用户在应用内选了与系统相反的明暗时，状态栏/导航栏图标也要跟着变
+            DisposableEffect(dark) {
+                val style = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT) { dark }
+                enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+                onDispose { }
+            }
+            AppTheme(ap) { BiliMusicApp(vm) }
+        }
     }
 }
 
@@ -98,7 +110,8 @@ fun BiliMusicApp(vm: AppViewModel = viewModel()) {
         NavHost(nav, startDestination = "library", modifier = Modifier.padding(pad)) {
             composable("library") { LibraryScreen(vm) { nav.navigate("list/$it") } }
             composable("search") { SearchScreen(vm) }
-            composable("account") { AccountScreen(vm) { nav.navigate("login") } }
+            composable("account") { AccountScreen(vm, onLogin = { nav.navigate("login") }, onSettings = { nav.navigate("settings") }) }
+            composable("settings") { SettingsScreen(vm) { nav.popBackStack() } }
             composable("list/{id}", arguments = listOf(navArgument("id") { type = NavType.LongType })) {
                 ListScreen(vm, it.arguments!!.getLong("id")) { nav.popBackStack() }
             }
@@ -110,6 +123,9 @@ fun BiliMusicApp(vm: AppViewModel = viewModel()) {
             }
         }
     }
+
+    val pending by vm.pendingImport.collectAsStateWithLifecycle()
+    pending?.let { ImportPreviewDialog(it.plan, onConfirm = vm::confirmImport, onDismiss = vm::cancelImport) }
 
     // 正在播放：从下方淡入并上移，时长 240ms
     AnimatedVisibility(
@@ -186,7 +202,7 @@ private fun NowPlayingScreen(vm: AppViewModel, p: PlayerUi, onClose: () -> Unit)
             }
         }
         Spacer(Modifier.weight(1f))
-        Cover(p.cover, 280.dp, RadiusLg)
+        Cover(p.cover, 280.dp, t.radiusLg)
         Spacer(Modifier.height(32.dp))
         Text(p.title, style = MaterialTheme.typography.titleLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.height(4.dp))

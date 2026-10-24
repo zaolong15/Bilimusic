@@ -5,13 +5,18 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.bilimusic.App
 import app.bilimusic.data.*
+import android.net.Uri
 import app.bilimusic.player.PlayerUi
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 const val FAVORITES_ID = -1L
+const val DOWNLOADS_ID = -2L
+
+class PendingImport(val parsed: Parsed, val plan: Plan)
 
 data class SearchState(
     val query: String = "",
@@ -28,6 +33,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val session = graph.session
     private val dao = graph.db.dao()
     private val conn = graph.player
+    private val dl = graph.downloader
+    private val prefs = graph.prefs
 
     val player: StateFlow<PlayerUi> = conn.state
     val progress = conn.progress
@@ -41,9 +48,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val favoriteCount: StateFlow<Int> = dao.favorites().map { it.size }.eager(0)
 
     // ---------- 资料库 ----------
-    fun songsOf(id: Long): Flow<List<Song>> = if (id == FAVORITES_ID) dao.favorites() else dao.playlistSongs(id)
-    fun nameOf(id: Long): Flow<String> =
-        if (id == FAVORITES_ID) flowOf("我喜欢的") else dao.playlistName(id).map { it.orEmpty() }
+    fun songsOf(id: Long): Flow<List<Song>> = when (id) {
+        FAVORITES_ID -> dao.favorites()
+        DOWNLOADS_ID -> dao.downloaded()
+        else -> dao.playlistSongs(id)
+    }
+    fun nameOf(id: Long): Flow<String> = when (id) {
+        FAVORITES_ID -> flowOf("我喜欢的")
+        DOWNLOADS_ID -> flowOf("已下载")
+        else -> dao.playlistName(id).map { it.orEmpty() }
+    }
 
     /** 把整个列表放进播放队列，从 start 开始播放，播完自动接下一首。 */
     fun playQueue(songs: List<Song>, start: Int, shuffle: Boolean = false) {
@@ -102,13 +116,120 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun removeFromPlaylist(pid: Long, song: Song) {
         viewModelScope.launch {
-            if (pid == FAVORITES_ID) dao.setFavorite(song.bvid, false, 0)
-            else dao.removeFromPlaylist(pid, song.bvid)
+            when (pid) {
+                FAVORITES_ID -> dao.setFavorite(song.bvid, false, 0)
+                DOWNLOADS_ID -> dl.remove(song.bvid)
+                else -> dao.removeFromPlaylist(pid, song.bvid)
+            }
         }
     }
 
     fun renamePlaylist(id: Long, name: String) { viewModelScope.launch { dao.renamePlaylist(id, name) } }
     fun deletePlaylist(id: Long) { viewModelScope.launch { dao.removePlaylist(id) } }
+
+    // ---------- 外观 ----------
+    val appearance = prefs.appearance
+    fun setAppearance(f: (Appearance) -> Appearance) = prefs.update(f)
+
+    // ---------- 下载 ----------
+    val downloadProgress = dl.active
+    val downloadedIds: StateFlow<Set<String>> = dao.downloadedIds().map { it.toSet() }.eager(emptySet())
+    val downloadedCount: StateFlow<Int> = dao.downloaded().map { it.size }.eager(0)
+    val storageBytes = MutableStateFlow(0L)
+
+    fun refreshStorage() { viewModelScope.launch(Dispatchers.IO) { storageBytes.value = dl.usedBytes() } }
+
+    fun download(songs: List<Song>) {
+        val todo = songs.filter { it.bvid !in downloadedIds.value }
+        if (todo.isEmpty()) { viewModelScope.launch { messages.emit("这些歌曲都已下载") }; return }
+        dl.enqueue(todo)
+        viewModelScope.launch { messages.emit("已加入下载队列，共 ${todo.size} 首") }
+    }
+
+    val wifiOnly = prefs.wifiOnly
+    fun setWifiOnly(v: Boolean) = prefs.setWifiOnly(v)
+    fun cancelDownload(bvid: String) = dl.cancel(bvid)
+
+    fun removeDownload(song: Song) { viewModelScope.launch { dl.remove(song.bvid); refreshStorage() } }
+
+    fun clearDownloads() {
+        viewModelScope.launch { dl.clearAll(); refreshStorage(); messages.emit("已清除全部下载") }
+    }
+
+    // ---------- 导入 / 导出 ----------
+    fun exportTo(uri: Uri, playlistId: Long?) {
+        viewModelScope.launch {
+            try {
+                val text = Backup.export(dao, playlistId)
+                withContext(Dispatchers.IO) {
+                    getApplication<Application>().contentResolver.openOutputStream(uri, "wt")!!.use { it.write(text.toByteArray()) }
+                }
+                messages.emit("已导出")
+            } catch (e: Exception) { messages.emit("导出失败。${e.message.orEmpty()}") }
+        }
+    }
+
+    /** 导入分两步：先读文件并生成预览，用户确认后才写入数据库。 */
+    val pendingImport = MutableStateFlow<PendingImport?>(null)
+    val linkImport = MutableStateFlow<String?>(null)
+
+    fun prepareImport(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val text = withContext(Dispatchers.IO) {
+                    getApplication<Application>().contentResolver.openInputStream(uri)!!.use { Backup.readLimited(it) }
+                }
+                val parsed = Backup.parse(text)
+                if (parsed.playlists.isEmpty() && parsed.favorites.isEmpty()) {
+                    messages.emit("文件里没有歌单或收藏。")
+                    return@launch
+                }
+                pendingImport.value = PendingImport(parsed, Backup.plan(dao, parsed))
+            } catch (e: BackupException) { messages.emit(e.message.orEmpty()) }
+            catch (e: Exception) { messages.emit("导入失败。无法读取这个文件。") }
+        }
+    }
+
+    fun cancelImport() { pendingImport.value = null }
+
+    fun confirmImport() {
+        val p = pendingImport.value ?: return
+        pendingImport.value = null
+        viewModelScope.launch {
+            try {
+                val r = Backup.apply(graph.db, p.parsed)
+                messages.emit("已导入：新建 ${r.created} 个歌单，并入 ${r.merged} 个，新增 ${r.newSongs} 首歌曲、${r.newFavorites} 首收藏")
+            } catch (e: Exception) { messages.emit("导入失败。${e.message.orEmpty()}") }
+        }
+    }
+
+    /** 从文本里找出 BV 号（支持完整链接、多行粘贴），逐个读取信息后建成歌单。 */
+    fun importLinks(name: String, text: String) {
+        val ids = Regex("BV[0-9A-Za-z]{10}").findAll(text).map { it.value }.distinct().take(200).toList()
+        if (ids.isEmpty()) {
+            viewModelScope.launch { messages.emit("没有找到 BV 号。请粘贴 BV 号或完整的视频链接（暂不支持 b23.tv 短链接）。") }
+            return
+        }
+        viewModelScope.launch {
+            val ok = ArrayList<Song>()
+            var failed = 0
+            var lastError: Exception? = null
+            ids.forEachIndexed { i, id ->
+                linkImport.value = "正在读取 ${i + 1}/${ids.size}…"
+                try { ok += withContext(Dispatchers.IO) { api.videoInfo(id) } }
+                catch (e: Exception) { failed++; lastError = e }
+                delay(120)   // 放慢节奏，减少被风控的概率
+            }
+            linkImport.value = null
+            if (ok.isEmpty()) {
+                messages.emit("没有读取到任何歌曲。${lastError?.friendly().orEmpty()}")
+                return@launch
+            }
+            val title = name.trim().ifBlank { "导入的歌单" }
+            Backup.apply(graph.db, Parsed(listOf(Draft(title, ok)), emptyList()))
+            messages.emit("已导入 ${ok.size} 首到「$title」" + if (failed > 0) "，$failed 条没能读取（可能已失效或无权限）" else "")
+        }
+    }
 
     // ---------- 搜索 ----------
     val search = MutableStateFlow(SearchState())
@@ -137,6 +258,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     init {
         refreshUser()
         viewModelScope.launch { conn.notices.collect { messages.emit(it) } }
+        viewModelScope.launch { dl.failures.collect { messages.emit(it) } }
+        viewModelScope.launch(Dispatchers.IO) { dl.reconcile() }
     }
 
     /** Cookie 还在但 B 站认为未登录 = 登录已过期，清掉并提示；单纯的网络错误不打扰用户。 */

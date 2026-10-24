@@ -1,6 +1,8 @@
 package app.bilimusic.data
 
 import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "songs")
@@ -11,7 +13,8 @@ data class Song(
     val cover: String,
     val durationSec: Int,
     val favorite: Boolean = false,
-    val favAt: Long = 0
+    val favAt: Long = 0,
+    val localPath: String? = null
 )
 
 @Entity(tableName = "playlists")
@@ -79,6 +82,47 @@ interface LibraryDao {
 
     @Query("SELECT s.* FROM songs s JOIN playlist_songs ps ON s.bvid=ps.bvid WHERE ps.playlistId=:pid ORDER BY ps.addedAt ASC")
     fun playlistSongs(pid: Long): Flow<List<Song>>
+
+    // ---- 下载 ----
+    @Query("UPDATE songs SET localPath=:path WHERE bvid=:bvid")
+    suspend fun setLocalPath(bvid: String, path: String?)
+
+    @Query("SELECT * FROM songs WHERE localPath IS NOT NULL ORDER BY title ASC")
+    fun downloaded(): Flow<List<Song>>
+
+    @Query("SELECT bvid FROM songs WHERE localPath IS NOT NULL")
+    fun downloadedIds(): Flow<List<String>>
+
+    @Query("SELECT * FROM songs WHERE localPath IS NOT NULL")
+    suspend fun downloadedOnce(): List<Song>
+
+    @Query("UPDATE songs SET localPath=NULL")
+    suspend fun clearAllLocalPaths()
+
+    // ---- 导入导出 ----
+    @Query("SELECT * FROM playlists WHERE id=:id")
+    suspend fun playlistOnce(id: Long): Playlist?
+
+    @Query("SELECT * FROM playlists ORDER BY createdAt ASC")
+    suspend fun allPlaylistsOnce(): List<Playlist>
+
+    @Query("SELECT s.* FROM songs s JOIN playlist_songs ps ON s.bvid=ps.bvid WHERE ps.playlistId=:pid ORDER BY ps.addedAt ASC")
+    suspend fun playlistSongsOnce(pid: Long): List<Song>
+
+    @Query("SELECT * FROM songs WHERE favorite=1 ORDER BY favAt ASC")
+    suspend fun favoritesOnce(): List<Song>
+
+    @Query("SELECT id FROM playlists WHERE name=:name LIMIT 1")
+    suspend fun playlistIdByName(name: String): Long?
+
+    @Query("SELECT bvid FROM playlist_songs WHERE playlistId=:pid")
+    suspend fun bvidsInPlaylist(pid: Long): List<String>
+
+    @Query("SELECT bvid FROM songs")
+    suspend fun allBvids(): List<String>
+
+    @Query("SELECT name FROM playlists")
+    suspend fun allPlaylistNames(): List<String>
 }
 
 suspend fun LibraryDao.ensureSong(s: Song) {
@@ -91,7 +135,13 @@ suspend fun LibraryDao.removePlaylist(id: Long) {
     deletePlaylist(id)
 }
 
-@Database(entities = [Song::class, Playlist::class, PlaylistSong::class], version = 1, exportSchema = false)
+@Database(entities = [Song::class, Playlist::class, PlaylistSong::class], version = 2, exportSchema = false)
 abstract class AppDb : RoomDatabase() {
     abstract fun dao(): LibraryDao
+}
+
+val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE songs ADD COLUMN localPath TEXT")
+    }
 }

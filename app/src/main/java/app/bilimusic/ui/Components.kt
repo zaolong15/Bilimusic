@@ -26,6 +26,9 @@ import app.bilimusic.data.Song
 import app.bilimusic.player.PlayerUi
 import coil.compose.AsyncImage
 
+/** 去掉文件名里不允许的字符。 */
+fun safeFileName(name: String): String = name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+
 fun fmtTime(sec: Int): String = "%d:%02d".format(sec / 60, sec % 60)
 
 @Composable
@@ -47,7 +50,7 @@ fun Hint(text: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun Cover(url: String, size: androidx.compose.ui.unit.Dp, radius: androidx.compose.ui.unit.Dp = RadiusSm) {
+fun Cover(url: String, size: androidx.compose.ui.unit.Dp, radius: androidx.compose.ui.unit.Dp = LocalTokens.current.radiusSm) {
     AsyncImage(
         model = url, contentDescription = null, contentScale = ContentScale.Crop,
         modifier = Modifier.size(size).clip(RoundedCornerShape(radius)).background(LocalTokens.current.bgSubtle)
@@ -59,6 +62,7 @@ fun SongRow(
     song: Song,
     current: Boolean,
     favorite: Boolean,
+    status: String?,
     onClick: () -> Unit,
     onFavorite: () -> Unit,
     menu: List<Pair<String, () -> Unit>>
@@ -77,7 +81,7 @@ fun SongRow(
                 color = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
             )
             Text(
-                "${song.artist} · ${fmtTime(song.durationSec)}", maxLines = 1, overflow = TextOverflow.Ellipsis,
+                "${song.artist} · ${fmtTime(song.durationSec)}" + (status?.let { " · $it" } ?: ""), maxLines = 1, overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
@@ -112,6 +116,8 @@ fun SongList(
     footer: (@Composable () -> Unit)? = null
 ) {
     val favIds by vm.favoriteIds.collectAsStateWithLifecycle()
+    val dlIds by vm.downloadedIds.collectAsStateWithLifecycle()
+    val dlProgress by vm.downloadProgress.collectAsStateWithLifecycle()
     var addTarget by remember { mutableStateOf<Song?>(null) }
     LazyColumn(Modifier.fillMaxSize()) {
         if (header != null) item { header() }
@@ -119,10 +125,19 @@ fun SongList(
             val s = songs[i]
             val menu = buildList<Pair<String, () -> Unit>> {
                 add("加入歌单" to { addTarget = s })
+                if (s.bvid in dlIds) add("删除下载" to { vm.removeDownload(s) })
+                else if (s.bvid !in dlProgress) add("下载到本地" to { vm.download(listOf(s)) })
+                else add("取消下载" to { vm.cancelDownload(s.bvid) })
                 if (removeLabel != null && onRemove != null) add(removeLabel to { onRemove(s) })
             }
             SongRow(
                 song = s, current = player.currentId == s.bvid, favorite = s.bvid in favIds,
+                status = when {
+                    s.bvid in dlIds -> "已下载"
+                    dlProgress[s.bvid] == -1f -> "排队中"
+                    dlProgress[s.bvid] != null -> "下载中 ${((dlProgress[s.bvid] ?: 0f) * 100).toInt()}%"
+                    else -> null
+                },
                 onClick = { onPlay(i) }, onFavorite = { vm.toggleFavorite(s) }, menu = menu
             )
         }
